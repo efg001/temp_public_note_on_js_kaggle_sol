@@ -1,70 +1,14 @@
-
-
-
-
-
-# Download and Install latest Python 3 (64-bit/Intel) + dependencies for screen recorder
-
-function Get-LatestPythonVersion {
-    $index = Invoke-WebRequest "https://www.python.org/ftp/python/" -UseBasicParsing
-    $versions = ($index.Links | Where-Object href -match "^\d+\.\d+\.\d+/$").href |
-        ForEach-Object { $_.TrimEnd('/') } |
-        Where-Object { $_ -match "^\d+\.\d+\.\d+$" } |
-        Sort-Object { [version]$_ } -Descending
-    return $versions[0]
-}
-
-# Main
-$ErrorActionPreference = "Stop"
-Write-Host "Locating latest Python 3 (64-bit) release..."
-$latest = Get-LatestPythonVersion
-Write-Host "Latest version found: $latest"
-
-$exe = "python-$latest-amd64.exe"
-$url = "https://www.python.org/ftp/python/$latest/$exe"
-$outfile = "$env:TEMP\$exe"
-
-Write-Host "Downloading: $url"
-Invoke-WebRequest -Uri $url -OutFile $outfile
-
-Write-Host "Running Python installer silently (per-user, add to PATH)..."
-Start-Process -FilePath $outfile -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0" -Wait
-
-Remove-Item $outfile
-
-# Find python path for user install
-$pythonDir = "$env:LOCALAPPDATA\Programs\Python"
-$pyExe = Get-ChildItem -Path $pythonDir -Recurse -Include "python.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if (-not $pyExe) {
-    Write-Error "Python was not installed. Exiting."
-    exit 1
-}
-$pythonPath = $pyExe.FullName
-
-# Optionally reload environment
-$env:PATH += ";$($pyExe.DirectoryName);$($pyExe.DirectoryName)\Scripts"
-
-Write-Host "Upgrading pip (package installer)..."
-& $pythonPath -m pip install --upgrade pip
-
-Write-Host "Installing dependencies: mss, opencv-python, keyboard, numpy"
-& $pythonPath -m pip install mss opencv-python keyboard numpy
-
-Write-Host "`nSetup complete! You may now run your Python screen recorder script."
-
-
-
 import tkinter as tk
 import threading
 import mss
 import cv2
 import numpy as np
-import keyboard
+import keyboard as kb
 import pyautogui
 import time
-import queue
 from pynput import mouse, keyboard as pynkeyboard
 
+# ------------------ AUTO CLICKER RECORDER ------------------
 class AutoClickerRecorder:
     def __init__(self, repeat_count, hotkey_record, hotkey_replay):
         self.repeat_count = repeat_count
@@ -74,44 +18,47 @@ class AutoClickerRecorder:
         self.actions = []
         self.recording = False
         self.replaying = False
-        self.recorder_thread = None
-        self.replay_thread = None
-        self.start_time = None
+        self.mouse_listener = None
+        self.keyboard_listener = None
+        self.stop_record_flag = threading.Event()
+        self.stop_replay_flag = threading.Event()
 
     def start_recording(self):
-        if self.recording:
-            return
+        if self.recording: return
         print("[AutoClicker] Start recording actions")
         self.recording = True
         self.actions = []
         self.start_time = time.time()
+        self.stop_record_flag.clear()
 
-        mouse_listener = mouse.Listener(on_click=self.on_click)
-        keyboard_listener = pynkeyboard.Listener(on_press=self.on_key)
+        self.mouse_listener = mouse.Listener(on_click=self.on_click)
+        self.keyboard_listener = pynkeyboard.Listener(on_press=self.on_press)
 
-        self.mouse_listener = mouse_listener
-        self.keyboard_listener = keyboard_listener
-
-        mouse_listener.start()
-        keyboard_listener.start()
-        self.recording_threads = [mouse_listener, keyboard_listener]
+        self.mouse_listener.start()
+        self.keyboard_listener.start()
 
     def stop_recording(self):
-        if not self.recording:
-            return
-        print("[AutoClicker] Stopped recording actions")
+        if not self.recording: return
+        print("[AutoClicker] Stop recording actions")
         self.recording = False
-        for listener in self.recording_threads:
-            listener.stop()
+        self.stop_record_flag.set()
+
+        if self.mouse_listener:
+            self.mouse_listener.stop()
+            self.mouse_listener = None
+        if self.keyboard_listener:
+            self.keyboard_listener.stop()
+            self.keyboard_listener = None
 
     def on_click(self, x, y, button, pressed):
-        if not self.recording: return
-        if pressed:
-            event_time = time.time() - self.start_time
-            self.actions.append(('mouse', event_time, x, y, button.name))
+        if not self.recording or not pressed:
+            return
+        event_time = time.time() - self.start_time
+        self.actions.append(('mouse', event_time, x, y, button.name))
 
-    def on_key(self, key):
-        if not self.recording: return
+    def on_press(self, key):
+        if not self.recording:
+            return
         event_time = time.time() - self.start_time
         try:
             k = key.char
@@ -122,38 +69,42 @@ class AutoClickerRecorder:
     def start_replay(self):
         if self.replaying or not self.actions:
             return
-        print("[AutoClicker] Start replaying actions")
+        print("[AutoClicker] Start replay actions")
         self.replaying = True
-        self.replay_thread = threading.Thread(target=self.replay)
-        self.replay_thread.start()
+        self.stop_replay_flag.clear()
+        t = threading.Thread(target=self._replay)
+        t.start()
 
     def stop_replay(self):
-        print("[AutoClicker] Stopped replaying actions")
+        if not self.replaying:
+            return
+        print("[AutoClicker] Stop replay actions")
         self.replaying = False
+        self.stop_replay_flag.set()
 
-    def replay(self):
-        times = self.repeat_count if self.repeat_count > 0 else float('inf')
-        for _ in range(int(times)):
-            if not self.replaying:
-                break
+    def _replay(self):
+        count = 0
+        max_times = self.repeat_count if self.repeat_count > 0 else float('inf')
+        while self.replaying and count < max_times and not self.stop_replay_flag.is_set():
             t0 = time.time()
             for event in self.actions:
-                if not self.replaying:
+                if not self.replaying or self.stop_replay_flag.is_set():
                     break
                 if event[0] == 'mouse':
                     _, event_time, x, y, button = event
-                    to_wait = event_time - (time.time() - t0)
-                    if to_wait > 0:
-                        time.sleep(to_wait)
+                    delay = event_time - (time.time() - t0)
+                    if delay > 0: time.sleep(delay)
                     pyautogui.click(x, y, button=button)
                 elif event[0] == 'key':
                     _, event_time, k = event
-                    to_wait = event_time - (time.time() - t0)
-                    if to_wait > 0:
-                        time.sleep(to_wait)
-                    pyautogui.press(k)
+                    delay = event_time - (time.time() - t0)
+                    if delay > 0: time.sleep(delay)
+                    # For special keys, check if single-letter or not
+                    if len(str(k)) == 1:
+                        pyautogui.press(k)
+            count += 1
 
-# --------- SCREEN RECORDER ---------
+# ------------------ SCREEN RECORDER ------------------
 class ScreenRecorder:
     def __init__(self):
         self.recording = False
@@ -164,7 +115,7 @@ class ScreenRecorder:
             return
         self.recording = True
         self.filename = filename
-        self.thread = threading.Thread(target=self.record_screen)
+        self.thread = threading.Thread(target=self.record_screen, daemon=True)
         self.thread.start()
 
     def stop_recording(self):
@@ -183,85 +134,103 @@ class ScreenRecorder:
                 time.sleep(1 / 20)
             out.release()
 
-# ------- GUI PART -----------
+# ------------------ MAIN TKINTER APP ------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Auto Clicker & Screen Recorder")
-        self.geometry("350x250")
+        self.geometry("350x260")
 
+        # Hold settings data as tk.StringVars
         self.data = {
             "repeat_count": tk.StringVar(value="1"),
             "hotkey_record": tk.StringVar(value="F9"),
             "hotkey_replay": tk.StringVar(value="F8"),
+            "screen_hotkey_record": tk.StringVar(value="F11"),
+            "screen_hotkey_stop": tk.StringVar(value="F12"),
         }
 
         self._build_gui()
         self.recorder = ScreenRecorder()
-        self.clicker = AutoClickerRecorder(repeat_count=1, hotkey_record='F9', hotkey_replay='F8')
-
-        self._bind_hotkeys()
+        self.clicker = AutoClickerRecorder(repeat_count=1, hotkey_record="F9", hotkey_replay="F8")
+        self.hotkey_refs = []
+        self.after(10, self._bind_hotkeys) # allow UI to init first
 
     def _build_gui(self):
         # Repeat Setting
-        tk.Label(self, text="Repeat Count: (0 = Forever)").pack(pady=5)
+        tk.Label(self, text="Repeat count (0 = Forever):").pack()
         tk.Entry(self, textvariable=self.data['repeat_count']).pack()
 
-        # Hotkey for Recording
-        tk.Label(self, text="Hotkey: Start/Stop Action Recording").pack(pady=5)
+        # Hotkeys for auto clicker
+        tk.Label(self, text="Hotkey: Start/Stop Action Recording").pack()
         tk.Entry(self, textvariable=self.data['hotkey_record']).pack()
-
-        # Hotkey for Replay
-        tk.Label(self, text="Hotkey: Start/Stop Replay Actions").pack(pady=5)
+        tk.Label(self, text="Hotkey: Start/Stop Replay Actions").pack()
         tk.Entry(self, textvariable=self.data['hotkey_replay']).pack()
+        # Hotkeys for screen recording
+        tk.Label(self, text="Hotkey: Start Screen Recording").pack()
+        tk.Entry(self, textvariable=self.data['screen_hotkey_record']).pack()
+        tk.Label(self, text="Hotkey: Stop Screen Recording").pack()
+        tk.Entry(self, textvariable=self.data['screen_hotkey_stop']).pack()
 
-        tk.Button(self, text="Apply Settings", command=self.apply_settings).pack(pady=10)
+        tk.Button(self, text="Apply Settings", command=self.apply_settings).pack(pady=9)
 
-        # Buttons to Start/Stop only for screen record
-        tk.Button(self, text="Start Screen Recording", command=self.start_screen_recording).pack(pady=2)
-        tk.Button(self, text="Stop Screen Recording", command=self.stop_screen_recording).pack(pady=2)
+        tk.Label(self, text="Or click manually below:").pack()
+        tk.Button(self, text="Start Screen Recording", command=self.start_screen_recording).pack()
+        tk.Button(self, text="Stop Screen Recording", command=self.stop_screen_recording).pack()
 
     def apply_settings(self):
-        repeat = self.data["repeat_count"].get()
         try:
-            repeat = int(repeat)
+            repeat = int(self.data["repeat_count"].get())
         except:
             repeat = 1
-        hotkey_record = self.data["hotkey_record"].get()
-        hotkey_replay = self.data["hotkey_replay"].get()
         self.clicker.repeat_count = repeat
-        self.clicker.hotkey_record = hotkey_record
-        self.clicker.hotkey_replay = hotkey_replay
-        self._unregister_hotkeys()
-        self._bind_hotkeys()
-        print("[GUI] Settings applied")
+        self.clicker.hotkey_record = self.data["hotkey_record"].get()
+        self.clicker.hotkey_replay = self.data["hotkey_replay"].get()
 
-    def _unregister_hotkeys(self):
-        keyboard.unhook_all_hotkeys()
+        self._unbind_hotkeys()
+        self._bind_hotkeys()
+        print("Settings applied")
+
+    def _unbind_hotkeys(self):
+        for ref in self.hotkey_refs:
+            kb.remove_hotkey(ref)
+        self.hotkey_refs = []
 
     def _bind_hotkeys(self):
-        # Action Record hotkey
-        keyboard.add_hotkey(self.data['hotkey_record'].get(), self.toggle_action_record)
-        # Action Replay hotkey
-        keyboard.add_hotkey(self.data['hotkey_replay'].get(), self.toggle_replay)
+        # Action record hotkey:
+        record_hotkey = self.data['hotkey_record'].get()
+        replay_hotkey = self.data['hotkey_replay'].get()
+        screen_start = self.data['screen_hotkey_record'].get()
+        screen_stop = self.data['screen_hotkey_stop'].get()
 
-    def toggle_action_record(self):
+        # Safe: can add handler multiple times, will overwrite (if not, that's why we keep `hotkey_refs`)
+        self.hotkey_refs.append(kb.add_hotkey(record_hotkey, self._cb_toggle_action_record))
+        self.hotkey_refs.append(kb.add_hotkey(replay_hotkey, self._cb_toggle_replay))
+        self.hotkey_refs.append(kb.add_hotkey(screen_start, self.start_screen_recording))
+        self.hotkey_refs.append(kb.add_hotkey(screen_stop, self.stop_screen_recording))
+        print("Hotkeys applied")
+
+    # --- Auto Clicker handlers ---
+    def _cb_toggle_action_record(self):
         if self.clicker.recording:
             self.clicker.stop_recording()
         else:
             self.clicker.start_recording()
 
-    def toggle_replay(self):
+    def _cb_toggle_replay(self):
         if self.clicker.replaying:
             self.clicker.stop_replay()
         else:
             self.clicker.start_replay()
 
+    # --- Screen record handlers ---
     def start_screen_recording(self):
-        self.recorder.start_recording()
+        if not self.recorder.recording:
+            self.recorder.start_recording()
 
     def stop_screen_recording(self):
-        self.recorder.stop_recording()
+        if self.recorder.recording:
+            self.recorder.stop_recording()
 
 if __name__ == "__main__":
     app = App()

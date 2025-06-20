@@ -1,41 +1,208 @@
-# Project Overview
 
-## Summary
 
-The provided dataset appears to be smoothed, potentially using Exponential Moving Average (EMA). This smoothing makes temporal models less attractive because the features of a given timestamp already incorporate information from previous timestamps, preventing the separation of information.
 
-For tabular data, model selection generally does  [not significantly impact performance](https://arxiv.org/pdf/2305.02997) so I decided to start with a simple Multi-Layer Perceptron (MLP). 
 
-**Note:** This model is not yet tuned (512 is a randomly chosen number for the hidden state), and the attached code snippet is only a representation of what I currently have for sharing(actual script have more debugging/training stat monitoring hook and todo comment for myself)
 
-## Details
+# Download and Install latest Python 3 (64-bit/Intel) + dependencies for screen recorder
 
-### Initialization
-- **Zero Initialization:** Both input and hidden layer weights are initialized to zero.
-- **R² Metric:** The competition uses R² as the evaluation metric. A prediction of zero yields an R² score of zero. Given the nature of the data, it is unavoidable for some days/batches—especially with an undertrained model—to make predictions that result in a negative score. Zero initialization helps the model find the baseline again.
+function Get-LatestPythonVersion {
+    $index = Invoke-WebRequest "https://www.python.org/ftp/python/" -UseBasicParsing
+    $versions = ($index.Links | Where-Object href -match "^\d+\.\d+\.\d+/$").href |
+        ForEach-Object { $_.TrimEnd('/') } |
+        Where-Object { $_ -match "^\d+\.\d+\.\d+$" } |
+        Sort-Object { [version]$_ } -Descending
+    return $versions[0]
+}
 
-### Network Configuration
-- **Avoiding Vanishing Gradients:** Without using gain (Xavier/Kaiming initialization), the network can suffer from vanishing gradients because activation functions shrink the variances of the output. However, with the right learning rate schedule and the Adam optimizer, the model converges reasonably well.
-- **ReLU Activation:** At the start of training, using ReLU with a uniformly sampled random bias causes the output layer to produce results very close to zero, which serves as a desired baseline and does not prevent the model from learning.
+# Main
+$ErrorActionPreference = "Stop"
+Write-Host "Locating latest Python 3 (64-bit) release..."
+$latest = Get-LatestPythonVersion
+Write-Host "Latest version found: $latest"
 
-### Model Architecture
-- **Multivariable Responder Regression:** Added an MLP for multivariable responder regression, taking the last hidden state as a feature.
-- **Responder Prediction MLP:** Added an MLP for predicting all responders, utilizing the last hidden state as a PLS/PCA-like transformed feature that captures information from other responders to predict the scored responder. Although an autoencoder is a more straightforward solution, the last competition’s winning solution used it, so I opted to explore an alternative approach.
+$exe = "python-$latest-amd64.exe"
+$url = "https://www.python.org/ftp/python/$latest/$exe"
+$outfile = "$env:TEMP\$exe"
 
-### Data Handling
-- **Gapped Batching:** 
-  - **Issue:** The features and targets are suspected to be smoothed with EMA (due to strong correlation between intraday lagged features and responders). Feeding continuous batches encourages the model to leverage leakage from the previous batch.
-  - **Solution:** Instead of batching inputs sequentially (e.g., 1–batch size, batch size+1–batch size*2), use gapped batching such as 1–batch size, batch size*2–batch size*3, etc. This reduces leakage by ensuring that consecutive batches do not overlap in a way that allows the model to exploit smoothed information from previous batches.
+Write-Host "Downloading: $url"
+Invoke-WebRequest -Uri $url -OutFile $outfile
 
-- **Data Cleaning:**
-  - **Sample Removal:** Removed 4 out of 250 days' worth of samples for each symbol.
-  - **Clipping Instead of Standard Scaling:** Instead of standard scaling, applied clipping to handle outliers.
-  - **Earnings Date Handling:** It is suspected that the data is not thoroughly cleaned for modeling purposes. To account for potential earnings dates where intraday technical indicator-based models should handle data differently, one day per quarter was removed. This avoids large losses that could penalize the model for factors it does not have information to predict.
+Write-Host "Running Python installer silently (per-user, add to PATH)..."
+Start-Process -FilePath $outfile -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0" -Wait
 
-## Future Work
-- **Model Tuning:** The current MLP model uses a randomly chosen hidden state size of 512. Future work includes tuning this hyperparameter for optimal performance.
-- **Alternative Architectures:** Exploring other model architectures beyond MLPs to potentially improve performance despite the smoothed nature of the dataset.
+Remove-Item $outfile
 
-## References
-- [Model Selection in Tabular Data](https://arxiv.org/pdf/2305.02997)
+# Find python path for user install
+$pythonDir = "$env:LOCALAPPDATA\Programs\Python"
+$pyExe = Get-ChildItem -Path $pythonDir -Recurse -Include "python.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $pyExe) {
+    Write-Error "Python was not installed. Exiting."
+    exit 1
+}
+$pythonPath = $pyExe.FullName
 
+# Optionally reload environment
+$env:PATH += ";$($pyExe.DirectoryName);$($pyExe.DirectoryName)\Scripts"
+
+Write-Host "Upgrading pip (package installer)..."
+& $pythonPath -m pip install --upgrade pip
+
+Write-Host "Installing dependencies: mss, opencv-python, keyboard, numpy"
+& $pythonPath -m pip install mss opencv-python keyboard numpy
+
+Write-Host "`nSetup complete! You may now run your Python screen recorder script."
+
+
+
+
+
+
+import tkinter as tk
+from tkinter import messagebox
+import threading
+import mss
+import cv2
+import numpy as np
+import keyboard
+import os
+import time
+import sys
+import subprocess
+
+recording = False
+playing = False
+video_filename = "screen_record.avi"
+repeat_setting = 1    # default 1 (set via GUI)
+
+def record_screen():
+    global recording, video_filename
+    with mss.mss() as sct:
+        mon = sct.monitors[1]
+        width, height = mon["width"], mon["height"]
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        out = cv2.VideoWriter(video_filename, fourcc, 20.0, (width, height))
+        print("Recording started. Press F9 to stop.")
+        while recording:
+            img = np.array(sct.grab(mon))
+            frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            out.write(frame)
+            cv2.waitKey(1)
+        out.release()
+    print("Recording stopped. File saved as:", video_filename)
+
+def get_video_length(filepath):
+    cap = cv2.VideoCapture(filepath)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 20
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    duration = frame_count / fps
+    return duration
+
+def playback_video(repeat):
+    global playing, video_filename
+    print(f"Playback started! Repeat: {'infinite' if repeat==0 else repeat} (Press F10 to stop).")
+    count = 0
+    while playing and (repeat == 0 or count < repeat):
+        try:
+            os.startfile(video_filename)
+        except AttributeError:
+            subprocess.run(['open', video_filename])
+        except Exception as ex:
+            print("Failed to start playback:", ex)
+            break
+        wait_time = get_video_length(video_filename)
+        t0 = time.time()
+        while playing and (time.time() - t0 < wait_time):
+            time.sleep(0.2)
+        count += 1
+    print("Playback stopped.")
+
+def hotkey_listener():
+    global recording, playing, repeat_setting
+    rec_thread = None
+    play_thread = None
+    while True:
+        if keyboard.is_pressed('F9'):
+            if not recording and not playing:
+                recording = True
+                rec_thread = threading.Thread(target=record_screen, daemon=True)
+                rec_thread.start()
+                show_message("Recording started! Press F9 again to stop.")
+                while keyboard.is_pressed('F9'):
+                    time.sleep(0.1)
+            elif recording:
+                recording = False
+                if rec_thread:
+                    rec_thread.join()
+                show_message("Recording stopped!")
+                while keyboard.is_pressed('F9'):
+                    time.sleep(0.1)
+        if keyboard.is_pressed('F10'):
+            if not playing and os.path.exists(video_filename) and not recording:
+                playing = True
+                play_thread = threading.Thread(target=playback_video, args=(repeat_setting,), daemon=True)
+                play_thread.start()
+                show_message("Playback started! Press F10 to stop.")
+                while keyboard.is_pressed('F10'):
+                    time.sleep(0.1)
+            elif playing:
+                playing = False
+                if play_thread:
+                    play_thread.join()
+                show_message("Playback stopped!")
+                while keyboard.is_pressed('F10'):
+                    time.sleep(0.1)
+        time.sleep(0.15)
+
+def show_message(msg):
+    try:
+        # Thread-safe popup
+        root.after(0, lambda: messagebox.showinfo("Info", msg))
+    except Exception:
+        pass
+
+def on_apply():
+    global repeat_setting
+    val = entry_repeat.get()
+    try:
+        rc = int(val)
+        if rc < 0: raise ValueError()
+        repeat_setting = rc
+        show_message(
+            "Settings applied!\n\n"
+            "F9: Start/stop recording\n"
+            "F10: Start/stop playing\n"
+            "Minimize or close this window and use hotkeys."
+        )
+        root.iconify()
+    except ValueError:
+        messagebox.showerror("Error", "Please enter a valid repeat count (0 = infinite, or higher).")
+
+def on_exit():
+    root.destroy()
+    sys.exit(0)
+
+# --- GUI Setup ---
+root = tk.Tk()
+root.title("Screen Recorder Settings")
+root.resizable(False, False)
+tk.Label(root, text="Screen Recorder Settings (minimize and use hotkeys)").pack(padx=10, pady=(10,2))
+frame_row = tk.Frame(root)
+frame_row.pack(pady=(0,5))
+
+tk.Label(frame_row, text="Repeat count for playback:").pack(side='left', padx=(0,5))
+entry_repeat = tk.Entry(frame_row, width=6)
+entry_repeat.insert(0, str(repeat_setting))
+entry_repeat.pack(side='left')
+tk.Label(frame_row, text="(0 = infinite)").pack(side='left', padx=(5,2))
+btn_apply = tk.Button(root, text="Apply & Minimize", command=on_apply)
+btn_exit = tk.Button(root, text="Exit", command=on_exit)
+btn_apply.pack(side='left', padx=(20,5), pady=10)
+btn_exit.pack(side='right', padx=(5,20), pady=10)
+
+# --- Start hotkey listener ---
+listener_thread = threading.Thread(target=hotkey_listener, daemon=True)
+listener_thread.start()
+
+# ---- Run the main window ----
+root.mainloop()

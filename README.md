@@ -235,3 +235,42 @@ class App(tk.Tk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
+
+
+
+# Define the file path
+$filePath = "C:\Path\To\YourFile.txt"
+
+# Path to handle.exe
+$handlePath = "C:\Sysinternals\handle.exe"
+
+# Check if handle.exe exists
+if (-not (Test-Path $handlePath)) {
+    Write-Error "handle.exe not found. Download it from Sysinternals."
+    exit
+}
+
+# Run handle.exe to find processes locking the file
+$handleOutput = & $handlePath $filePath
+
+# Parse handle.exe output to find process IDs (PIDs)
+$pid = $handleOutput | Select-String "pid: (\d+)" | ForEach-Object { $_.Matches.Groups[1].Value }
+
+if ($pid) {
+    # Loop through each PID (in case multiple processes lock the file)
+    foreach ($id in $pid) {
+        Write-Host "Terminating process with PID: $id"
+        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Wait briefly to ensure the file is released
+Start-Sleep -Milliseconds 500
+
+# Delete the file
+if (Test-Path $filePath) {
+    Remove-Item -Path $filePath -Force -ErrorAction Stop
+    Write-Host "File deleted successfully: $filePath"
+} else {
+    Write-Host "File not found: $filePath"
+}

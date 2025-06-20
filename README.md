@@ -54,155 +54,215 @@ Write-Host "`nSetup complete! You may now run your Python screen recorder script
 
 
 
-
-
-
 import tkinter as tk
-from tkinter import messagebox
 import threading
 import mss
 import cv2
 import numpy as np
 import keyboard
-import os
+import pyautogui
 import time
-import sys
-import subprocess
+import queue
+from pynput import mouse, keyboard as pynkeyboard
 
-recording = False
-playing = False
-video_filename = "screen_record.avi"
-repeat_setting = 1    # default 1 (set via GUI)
+class AutoClickerRecorder:
+    def __init__(self, repeat_count, hotkey_record, hotkey_replay):
+        self.repeat_count = repeat_count
+        self.hotkey_record = hotkey_record
+        self.hotkey_replay = hotkey_replay
 
-def record_screen():
-    global recording, video_filename
-    with mss.mss() as sct:
-        mon = sct.monitors[1]
-        width, height = mon["width"], mon["height"]
-        fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        out = cv2.VideoWriter(video_filename, fourcc, 20.0, (width, height))
-        print("Recording started. Press F9 to stop.")
-        while recording:
-            img = np.array(sct.grab(mon))
-            frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            out.write(frame)
-            cv2.waitKey(1)
-        out.release()
-    print("Recording stopped. File saved as:", video_filename)
+        self.actions = []
+        self.recording = False
+        self.replaying = False
+        self.recorder_thread = None
+        self.replay_thread = None
+        self.start_time = None
 
-def get_video_length(filepath):
-    cap = cv2.VideoCapture(filepath)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 20
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    cap.release()
-    duration = frame_count / fps
-    return duration
+    def start_recording(self):
+        if self.recording:
+            return
+        print("[AutoClicker] Start recording actions")
+        self.recording = True
+        self.actions = []
+        self.start_time = time.time()
 
-def playback_video(repeat):
-    global playing, video_filename
-    print(f"Playback started! Repeat: {'infinite' if repeat==0 else repeat} (Press F10 to stop).")
-    count = 0
-    while playing and (repeat == 0 or count < repeat):
+        mouse_listener = mouse.Listener(on_click=self.on_click)
+        keyboard_listener = pynkeyboard.Listener(on_press=self.on_key)
+
+        self.mouse_listener = mouse_listener
+        self.keyboard_listener = keyboard_listener
+
+        mouse_listener.start()
+        keyboard_listener.start()
+        self.recording_threads = [mouse_listener, keyboard_listener]
+
+    def stop_recording(self):
+        if not self.recording:
+            return
+        print("[AutoClicker] Stopped recording actions")
+        self.recording = False
+        for listener in self.recording_threads:
+            listener.stop()
+
+    def on_click(self, x, y, button, pressed):
+        if not self.recording: return
+        if pressed:
+            event_time = time.time() - self.start_time
+            self.actions.append(('mouse', event_time, x, y, button.name))
+
+    def on_key(self, key):
+        if not self.recording: return
+        event_time = time.time() - self.start_time
         try:
-            os.startfile(video_filename)
+            k = key.char
         except AttributeError:
-            subprocess.run(['open', video_filename])
-        except Exception as ex:
-            print("Failed to start playback:", ex)
-            break
-        wait_time = get_video_length(video_filename)
-        t0 = time.time()
-        while playing and (time.time() - t0 < wait_time):
-            time.sleep(0.2)
-        count += 1
-    print("Playback stopped.")
+            k = str(key)
+        self.actions.append(('key', event_time, k))
 
-def hotkey_listener():
-    global recording, playing, repeat_setting
-    rec_thread = None
-    play_thread = None
-    while True:
-        if keyboard.is_pressed('F9'):
-            if not recording and not playing:
-                recording = True
-                rec_thread = threading.Thread(target=record_screen, daemon=True)
-                rec_thread.start()
-                show_message("Recording started! Press F9 again to stop.")
-                while keyboard.is_pressed('F9'):
-                    time.sleep(0.1)
-            elif recording:
-                recording = False
-                if rec_thread:
-                    rec_thread.join()
-                show_message("Recording stopped!")
-                while keyboard.is_pressed('F9'):
-                    time.sleep(0.1)
-        if keyboard.is_pressed('F10'):
-            if not playing and os.path.exists(video_filename) and not recording:
-                playing = True
-                play_thread = threading.Thread(target=playback_video, args=(repeat_setting,), daemon=True)
-                play_thread.start()
-                show_message("Playback started! Press F10 to stop.")
-                while keyboard.is_pressed('F10'):
-                    time.sleep(0.1)
-            elif playing:
-                playing = False
-                if play_thread:
-                    play_thread.join()
-                show_message("Playback stopped!")
-                while keyboard.is_pressed('F10'):
-                    time.sleep(0.1)
-        time.sleep(0.15)
+    def start_replay(self):
+        if self.replaying or not self.actions:
+            return
+        print("[AutoClicker] Start replaying actions")
+        self.replaying = True
+        self.replay_thread = threading.Thread(target=self.replay)
+        self.replay_thread.start()
 
-def show_message(msg):
-    try:
-        # Thread-safe popup
-        root.after(0, lambda: messagebox.showinfo("Info", msg))
-    except Exception:
-        pass
+    def stop_replay(self):
+        print("[AutoClicker] Stopped replaying actions")
+        self.replaying = False
 
-def on_apply():
-    global repeat_setting
-    val = entry_repeat.get()
-    try:
-        rc = int(val)
-        if rc < 0: raise ValueError()
-        repeat_setting = rc
-        show_message(
-            "Settings applied!\n\n"
-            "F9: Start/stop recording\n"
-            "F10: Start/stop playing\n"
-            "Minimize or close this window and use hotkeys."
-        )
-        root.iconify()
-    except ValueError:
-        messagebox.showerror("Error", "Please enter a valid repeat count (0 = infinite, or higher).")
+    def replay(self):
+        times = self.repeat_count if self.repeat_count > 0 else float('inf')
+        for _ in range(int(times)):
+            if not self.replaying:
+                break
+            t0 = time.time()
+            for event in self.actions:
+                if not self.replaying:
+                    break
+                if event[0] == 'mouse':
+                    _, event_time, x, y, button = event
+                    to_wait = event_time - (time.time() - t0)
+                    if to_wait > 0:
+                        time.sleep(to_wait)
+                    pyautogui.click(x, y, button=button)
+                elif event[0] == 'key':
+                    _, event_time, k = event
+                    to_wait = event_time - (time.time() - t0)
+                    if to_wait > 0:
+                        time.sleep(to_wait)
+                    pyautogui.press(k)
 
-def on_exit():
-    root.destroy()
-    sys.exit(0)
+# --------- SCREEN RECORDER ---------
+class ScreenRecorder:
+    def __init__(self):
+        self.recording = False
+        self.thread = None
 
-# --- GUI Setup ---
-root = tk.Tk()
-root.title("Screen Recorder Settings")
-root.resizable(False, False)
-tk.Label(root, text="Screen Recorder Settings (minimize and use hotkeys)").pack(padx=10, pady=(10,2))
-frame_row = tk.Frame(root)
-frame_row.pack(pady=(0,5))
+    def start_recording(self, filename="recording.mp4"):
+        if self.recording:
+            return
+        self.recording = True
+        self.filename = filename
+        self.thread = threading.Thread(target=self.record_screen)
+        self.thread.start()
 
-tk.Label(frame_row, text="Repeat count for playback:").pack(side='left', padx=(0,5))
-entry_repeat = tk.Entry(frame_row, width=6)
-entry_repeat.insert(0, str(repeat_setting))
-entry_repeat.pack(side='left')
-tk.Label(frame_row, text="(0 = infinite)").pack(side='left', padx=(5,2))
-btn_apply = tk.Button(root, text="Apply & Minimize", command=on_apply)
-btn_exit = tk.Button(root, text="Exit", command=on_exit)
-btn_apply.pack(side='left', padx=(20,5), pady=10)
-btn_exit.pack(side='right', padx=(5,20), pady=10)
+    def stop_recording(self):
+        self.recording = False
 
-# --- Start hotkey listener ---
-listener_thread = threading.Thread(target=hotkey_listener, daemon=True)
-listener_thread.start()
+    def record_screen(self):
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            width, height = monitor['width'], monitor['height']
+            out = cv2.VideoWriter(self.filename, fourcc, 20, (width, height))
+            while self.recording:
+                img = np.array(sct.grab(monitor))
+                frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                out.write(frame)
+                time.sleep(1 / 20)
+            out.release()
 
-# ---- Run the main window ----
-root.mainloop()
+# ------- GUI PART -----------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Auto Clicker & Screen Recorder")
+        self.geometry("350x250")
+
+        self.data = {
+            "repeat_count": tk.StringVar(value="1"),
+            "hotkey_record": tk.StringVar(value="F9"),
+            "hotkey_replay": tk.StringVar(value="F8"),
+        }
+
+        self._build_gui()
+        self.recorder = ScreenRecorder()
+        self.clicker = AutoClickerRecorder(repeat_count=1, hotkey_record='F9', hotkey_replay='F8')
+
+        self._bind_hotkeys()
+
+    def _build_gui(self):
+        # Repeat Setting
+        tk.Label(self, text="Repeat Count: (0 = Forever)").pack(pady=5)
+        tk.Entry(self, textvariable=self.data['repeat_count']).pack()
+
+        # Hotkey for Recording
+        tk.Label(self, text="Hotkey: Start/Stop Action Recording").pack(pady=5)
+        tk.Entry(self, textvariable=self.data['hotkey_record']).pack()
+
+        # Hotkey for Replay
+        tk.Label(self, text="Hotkey: Start/Stop Replay Actions").pack(pady=5)
+        tk.Entry(self, textvariable=self.data['hotkey_replay']).pack()
+
+        tk.Button(self, text="Apply Settings", command=self.apply_settings).pack(pady=10)
+
+        # Buttons to Start/Stop only for screen record
+        tk.Button(self, text="Start Screen Recording", command=self.start_screen_recording).pack(pady=2)
+        tk.Button(self, text="Stop Screen Recording", command=self.stop_screen_recording).pack(pady=2)
+
+    def apply_settings(self):
+        repeat = self.data["repeat_count"].get()
+        try:
+            repeat = int(repeat)
+        except:
+            repeat = 1
+        hotkey_record = self.data["hotkey_record"].get()
+        hotkey_replay = self.data["hotkey_replay"].get()
+        self.clicker.repeat_count = repeat
+        self.clicker.hotkey_record = hotkey_record
+        self.clicker.hotkey_replay = hotkey_replay
+        self._unregister_hotkeys()
+        self._bind_hotkeys()
+        print("[GUI] Settings applied")
+
+    def _unregister_hotkeys(self):
+        keyboard.unhook_all_hotkeys()
+
+    def _bind_hotkeys(self):
+        # Action Record hotkey
+        keyboard.add_hotkey(self.data['hotkey_record'].get(), self.toggle_action_record)
+        # Action Replay hotkey
+        keyboard.add_hotkey(self.data['hotkey_replay'].get(), self.toggle_replay)
+
+    def toggle_action_record(self):
+        if self.clicker.recording:
+            self.clicker.stop_recording()
+        else:
+            self.clicker.start_recording()
+
+    def toggle_replay(self):
+        if self.clicker.replaying:
+            self.clicker.stop_replay()
+        else:
+            self.clicker.start_replay()
+
+    def start_screen_recording(self):
+        self.recorder.start_recording()
+
+    def stop_screen_recording(self):
+        self.recorder.stop_recording()
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
